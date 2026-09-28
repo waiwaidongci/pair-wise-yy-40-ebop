@@ -75,7 +75,8 @@ def make_handler(service: Service, static_dir: str):
 
         def do_GET(self) -> None:
             try:
-                path = urlparse(self.path).path
+                parsed = urlparse(self.path)
+                path = parsed.path
                 if path == "/health":
                     self._json(200, {"status": "ok"})
                 elif path == "/":
@@ -84,24 +85,45 @@ def make_handler(service: Service, static_dir: str):
                     actor, role = self._identity()
                     del actor
                     self._json(200, {"items": service.list_items(role)})
-                elif path.startswith("/api/items/") and path.endswith("/records"):
-                    item_id = int(path.split("/")[3])
-                    actor, role = self._identity()
-                    del actor
-                    self._json(200, {"records": service.list_records(item_id, role)})
-                elif path.startswith("/api/items/"):
-                    item_id = int(path.rsplit("/", 1)[-1])
-                    actor, role = self._identity()
-                    del actor
-                    self._json(200, service.get_item(item_id, role))
                 elif path == "/api/audit":
                     actor, role = self._identity()
                     del actor
                     self._json(200, {"events": service.audit(role)})
+                elif self._split_item_subpath(path) is not None:
+                    actor, role = self._identity()
+                    del actor
+                    item_id, sub = self._split_item_subpath(path)
+                    if sub is None:
+                        self._json(200, service.get_item(item_id, role))
+                    elif sub == "records":
+                        query = parse_qs(parsed.query)
+                        status = query.get("status", [None])[0]
+                        self._json(200, {"records": service.list_records(item_id, role, status)})
+                    elif sub.startswith("records/"):
+                        record_part = sub.split("/")[1]
+                        if not record_part.isdigit() or sub.count("/") != 1:
+                            self._json(404, {"error": "not_found"})
+                            return
+                        self._json(200, service.get_record(item_id, int(record_part), role))
+                    else:
+                        self._json(404, {"error": "not_found"})
                 else:
                     self._json(404, {"error": "not_found"})
             except Exception as exc:
                 self._send_error(exc)
+
+        @staticmethod
+        def _split_item_subpath(path: str) -> Optional[Tuple[int, Optional[str]]]:
+            """匹配 /api/items/{id} 与 /api/items/{id}/{sub...}。"""
+            parts = path.strip("/").split("/")
+            if len(parts) < 3 or parts[:2] != ["api", "items"]:
+                return None
+            if not parts[2].isdigit():
+                return None
+            item_id = int(parts[2])
+            if len(parts) == 3:
+                return item_id, None
+            return item_id, "/".join(parts[3:])
 
         def do_POST(self) -> None:
             try:
@@ -110,15 +132,24 @@ def make_handler(service: Service, static_dir: str):
                 body = self._body()
                 if path == "/api/items":
                     self._json(201, service.create_item(body, actor, role))
-                elif path.startswith("/api/items/") and path.endswith("/records"):
-                    item_id = int(path.split("/")[3])
-                    self._json(201, service.add_record(item_id, body, actor, role))
-                elif path.startswith("/api/items/") and path.endswith("/transition"):
-                    item_id = int(path.split("/")[3])
-                    target = body.get("target")
-                    expected = body.get("expected_version")
-                    self._json(200, service.transition(
-                        item_id, target, expected, actor, role))
+                elif self._split_item_subpath(path) is not None:
+                    item_id, sub = self._split_item_subpath(path)
+                    if sub == "records":
+                        self._json(201, service.add_record(item_id, body, actor, role))
+                    elif sub.startswith("records/") and sub.endswith("/dispose"):
+                        record_part = sub[len("records/"):-len("/dispose")]
+                        if not record_part.isdigit() or "/" in record_part:
+                            self._json(404, {"error": "not_found"})
+                            return
+                        self._json(200, service.dispose_record(
+                            item_id, int(record_part), body, actor, role))
+                    elif sub == "transition":
+                        target = body.get("target")
+                        expected = body.get("expected_version")
+                        self._json(200, service.transition(
+                            item_id, target, expected, actor, role))
+                    else:
+                        self._json(404, {"error": "not_found"})
                 else:
                     self._json(404, {"error": "not_found"})
             except Exception as exc:

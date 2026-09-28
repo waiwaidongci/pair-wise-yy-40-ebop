@@ -52,8 +52,25 @@ class Repository:
                     external_ref TEXT,
                     created_by TEXT NOT NULL,
                     created_at TEXT NOT NULL,
+                    resolution_note TEXT,
+                    resolution_by TEXT,
+                    resolved_at TEXT,
+                    reopen_reason TEXT,
+                    reopened_by TEXT,
+                    reopened_at TEXT,
                     UNIQUE(item_id, external_ref)
                 );
+                CREATE TABLE IF NOT EXISTS record_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    record_id INTEGER NOT NULL REFERENCES records(id) ON DELETE CASCADE,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    action TEXT NOT NULL CHECK(action IN ('close','reopen')),
+                    note TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS ix_record_events_record
+                    ON record_events(record_id, id);
                 CREATE TABLE IF NOT EXISTS audit_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     action TEXT NOT NULL,
@@ -66,6 +83,18 @@ class Repository:
                     created_at TEXT NOT NULL
                 );
             """)
+            self._migrate_records()
+
+    def _migrate_records(self) -> None:
+        cols = {row["name"] for row in self.conn.execute("PRAGMA table_info(records)")}
+        additions = {
+            "resolution_note": "TEXT", "resolution_by": "TEXT", "resolved_at": "TEXT",
+            "reopen_reason": "TEXT", "reopened_by": "TEXT", "reopened_at": "TEXT",
+        }
+        with self.conn:
+            for name, ddl in additions.items():
+                if name not in cols:
+                    self.conn.execute(f"ALTER TABLE records ADD COLUMN {name} {ddl}")
 
     @staticmethod
     def _item(row: sqlite3.Row) -> Dict[str, Any]:
@@ -123,7 +152,7 @@ class Repository:
                 raise ConflictError("版本冲突，请刷新后重试")
         return self.get_item(item_id)
 
-    def add_record(self, item_id: int, kind: str, detail: str, status: str,
+    def add_record(self, item_id: int, kind: str, detail: str,
                    external_ref: Optional[str], actor: str) -> Dict[str, Any]:
         now = utc_now()
         self.get_item(item_id)
@@ -131,22 +160,34 @@ class Repository:
             with self._lock, self.conn:
                 cur = self.conn.execute(
                     """INSERT INTO records(item_id, kind, detail, status, external_ref,
-                       created_by, created_at) VALUES(?,?,?,?,?,?,?)""",
-                    (item_id, kind, detail, status, external_ref, actor, now),
+                       created_by, created_at) VALUES(?,?,?,'open',?,?,?)""",
+                    (item_id, kind, detail, external_ref, actor, now),
                 )
                 record_id = int(cur.lastrowid)
         except sqlite3.IntegrityError as exc:
             raise ConflictError("记录唯一标识已存在") from exc
-        with self._lock:
-            row = self.conn.execute("SELECT * FROM records WHERE id=?", (record_id,)).fetchone()
-        return dict(row)
+        return self.get_record(item_id, record_id)
 
-    def list_records(self, item_id: int) -> List[Dict[str, Any]]:
+    def get_record(self, item_id: int, record_id: int) -> Dict[str, Any]:
         self.get_item(item_id)
         with self._lock:
-            rows = self.conn.execute(
-                "SELECT * FROM records WHERE item_id=? ORDER BY id", (item_id,)
-            ).fetchall()
+            row = self.conn.execute(
+                "SELECT * FROM records WHERE item_id=? AND id=?", (item_id, record_id)
+            ).fetchone()
+        if row is None:
+            raise NotFoundError("事项不存在")
+        return dict(row)
+
+    def list_records(self, item_id: int, status: Optional[str] = None) -> List[Dict[str, Any]]:
+        self.get_item(item_id)
+        sql = "SELECT * FROM records WHERE item_id=?"
+        params: tuple = (item_id,)
+        if status:
+            sql += " AND status=?"
+            params = (item_id, status)
+        sql += " ORDER BY id"
+        with self._lock:
+            rows = self.conn.execute(sql, params).fetchall()
         return [dict(row) for row in rows]
 
     def open_record_count(self, item_id: int) -> int:
@@ -156,6 +197,57 @@ class Repository:
                 (item_id,),
             ).fetchone()
         return int(row["n"])
+
+    def dispose_record(self, item_id: int, record_id: int, action: str, note: str,
+                       actor: str) -> Dict[str, Any]:
+        """关闭/重开事项：同一事务内追加处置历史并推进项目版本。"""
+        now = utc_now()
+        if action == "close":
+            set_clause = ("status='closed', resolution_note=?, resolution_by=?, "
+                          "resolved_at=?, reopen_reason=NULL, reopened_by=NULL, reopened_at=NULL")
+            guard = "status='open'"
+        else:
+            set_clause = ("status='open', reopen_reason=?, reopened_by=?, reopened_at=?")
+            guard = "status='closed'"
+        with self._lock, self.conn:
+            exists_item = self.conn.execute("SELECT 1 FROM items WHERE id=?", (item_id,)).fetchone()
+            if exists_item is None:
+                raise NotFoundError("项目不存在")
+            row = self.conn.execute(
+                "SELECT id FROM records WHERE item_id=? AND id=?", (item_id, record_id)
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("事项不存在")
+            cur = self.conn.execute(
+                f"UPDATE records SET {set_clause} WHERE id=? AND item_id=? AND {guard}",
+                (note, actor, now, record_id, item_id),
+            )
+            if cur.rowcount == 0:
+                current = self.conn.execute(
+                    "SELECT status FROM records WHERE id=?", (record_id,)
+                ).fetchone()
+                if current["status"] == "closed":
+                    raise ConflictError("事项已关闭，不能重复关闭")
+                raise ConflictError("事项仍处于待办状态，不能重复重开")
+            self.conn.execute(
+                """INSERT INTO record_events(record_id, item_id, action, note, actor, created_at)
+                   VALUES(?,?,?,?,?,?)""",
+                (record_id, item_id, action, note, actor, now),
+            )
+            self.conn.execute(
+                "UPDATE items SET version=version+1, updated_at=? WHERE id=?",
+                (now, item_id),
+            )
+        return self.get_record(item_id, record_id)
+
+    def list_record_events(self, item_id: int, record_id: int) -> List[Dict[str, Any]]:
+        self.get_record(item_id, record_id)
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM record_events WHERE record_id=? ORDER BY id",
+                (record_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def append_audit(self, action: str, entity_type: str, entity_id: int,
                      actor: str, detail: dict) -> Dict[str, Any]:
