@@ -8,8 +8,7 @@ from typing import Any, Dict, List, Optional
 
 from .audit import make_entry, utc_now
 from .domain import ConflictError, NotFoundError
-from .rules import ID_PREFIX, STATES
-
+from .rules import ID_PREFIX, STATES, disposition_allowed
 
 class Repository:
     def __init__(self, db_path: str):
@@ -52,7 +51,22 @@ class Repository:
                     external_ref TEXT,
                     created_by TEXT NOT NULL,
                     created_at TEXT NOT NULL,
+                    disposition_note TEXT,
+                    disposition_by TEXT,
+                    disposition_at TEXT,
+                    reopen_reason TEXT,
                     UNIQUE(item_id, external_ref)
+                );
+                CREATE TABLE IF NOT EXISTS record_dispositions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    record_id INTEGER NOT NULL REFERENCES records(id) ON DELETE CASCADE,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    action TEXT NOT NULL CHECK(action IN ('close','reopen')),
+                    note TEXT NOT NULL,
+                    from_version INTEGER NOT NULL,
+                    to_version INTEGER NOT NULL,
+                    actor TEXT NOT NULL,
+                    created_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS audit_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -66,6 +80,20 @@ class Repository:
                     created_at TEXT NOT NULL
                 );
             """)
+        self._migrate_records()
+
+    def _migrate_records(self) -> None:
+        # 旧库的records表缺少处置列，按列补齐
+        cols = {r[1] for r in self.conn.execute("PRAGMA table_info(records)")}
+        with self.conn:
+            for name, ddl in (
+                ("disposition_note", "ALTER TABLE records ADD COLUMN disposition_note TEXT"),
+                ("disposition_by", "ALTER TABLE records ADD COLUMN disposition_by TEXT"),
+                ("disposition_at", "ALTER TABLE records ADD COLUMN disposition_at TEXT"),
+                ("reopen_reason", "ALTER TABLE records ADD COLUMN reopen_reason TEXT"),
+            ):
+                if name not in cols:
+                    self.conn.execute(ddl)
 
     @staticmethod
     def _item(row: sqlite3.Row) -> Dict[str, Any]:
@@ -156,6 +184,88 @@ class Repository:
                 (item_id,),
             ).fetchone()
         return int(row["n"])
+
+    def get_record(self, record_id: int) -> Dict[str, Any]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM records WHERE id=?", (record_id,)
+            ).fetchone()
+        if row is None:
+            raise NotFoundError("事项不存在")
+        return dict(row)
+
+    def open_record_ids(self, item_id: int) -> List[int]:
+        self.get_item(item_id)
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT id FROM records WHERE item_id=? AND status='open' ORDER BY id",
+                (item_id,),
+            ).fetchall()
+        return [int(r["id"]) for r in rows]
+
+    def dispose_record(self, record_id: int, action: str, note: str,
+                       expected_version: int, actor: str) -> Dict[str, Any]:
+        """提交处置并在同一事务内推进项目版本。
+
+        返回 {record, item, dispositions}。
+        """
+        now = utc_now()
+        with self._lock, self.conn:
+            record = self.conn.execute(
+                "SELECT * FROM records WHERE id=?", (record_id,)
+            ).fetchone()
+            if record is None:
+                raise NotFoundError("事项不存在")
+            item = self.get_item(int(record["item_id"]))
+            if not disposition_allowed(record["status"], action):
+                if action == "close":
+                    raise ConflictError("事项已关闭，不能重复关闭")
+                raise ConflictError("事项处于待办状态，不能重开")
+            new_status = "closed" if action == "close" else "open"
+            cur = self.conn.execute(
+                """UPDATE items SET version=version+1, updated_at=?
+                   WHERE id=? AND version=?""",
+                (now, item["id"], expected_version),
+            )
+            if cur.rowcount == 0:
+                raise ConflictError("版本冲突，请刷新后重试")
+            if action == "close":
+                self.conn.execute(
+                    """UPDATE records SET status='closed', disposition_note=?,
+                       disposition_by=?, disposition_at=?, reopen_reason=NULL
+                       WHERE id=?""",
+                    (note, actor, now, record_id),
+                )
+            else:
+                self.conn.execute(
+                    """UPDATE records SET status='open', reopen_reason=?,
+                       disposition_by=?, disposition_at=? WHERE id=?""",
+                    (note, actor, now, record_id),
+                )
+            self.conn.execute(
+                """INSERT INTO record_dispositions(record_id, item_id, action, note,
+                   from_version, to_version, actor, created_at)
+                   VALUES(?,?,?,?,?,?,?,?)""",
+                (record_id, item["id"], action, note,
+                 expected_version, expected_version + 1, actor, now),
+            )
+            updated_record = self.conn.execute(
+                "SELECT * FROM records WHERE id=?", (record_id,)
+            ).fetchone()
+        updated_item = self.get_item(int(record["item_id"]))
+        return {
+            "record": dict(updated_record),
+            "item": updated_item,
+            "dispositions": self.list_dispositions(record_id),
+        }
+
+    def list_dispositions(self, record_id: int) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM record_dispositions WHERE record_id=? ORDER BY id",
+                (record_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def append_audit(self, action: str, entity_type: str, entity_id: int,
                      actor: str, detail: dict) -> Dict[str, Any]:

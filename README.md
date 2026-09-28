@@ -29,10 +29,25 @@ python3 app.py --db ./data.db --port 8317
 - `POST /api/items`
 - `GET /api/items/{id}`
 - `POST /api/items/{id}/records`
+- `GET /api/items/{id}/records?status=open|closed`
+- `GET /api/items/{id}/blocking`，列出仍挡住验收的待办事项
 - `POST /api/items/{id}/transition`，必须提交`expected_version`
+- `POST /api/records/{id}/dispositions`，提交事项处置（见下）
+- `GET /api/records/{id}/dispositions`，处置历史
 - `GET /api/audit`
 
 允许角色：assessor, structural_engineer, review_board, viewer。风险分值和人员密度共同影响排序；审核通过前必须完成评估、设计和施工证据登记。
+
+## 复核事项处置
+
+复核阶段提出的事项（records）创建后可反复处置，不能一次写成已关闭了事：
+
+- `POST /api/records/{id}/dispositions`，请求体：`{"action":"close","note":"处理说明","expected_version":N}`。
+  - `action=close`：assessor或structural_engineer提交处理说明并关闭事项。
+  - `action=reopen`：仅review_board可操作，`note`为重开原因，必填。
+- 每次处置都会把项目版本`version+1`（与处置在同一事务内完成）；仍拿旧`expected_version`提交验收会返回409冲突。
+- 每个待办事项都关闭（`open_record_count=0`）后，项目才能转换到`accepted`；否则返回409并提示未关闭数量。
+- 项目详情包含`open_record_count`与`acceptance_blocked`字段，便于页面判断复核结论是否仍然有效。
 
 ## 测试
 

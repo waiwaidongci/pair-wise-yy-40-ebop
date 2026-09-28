@@ -1,1 +1,175 @@
-<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>建筑抗震鉴定与加固排序</title><style>body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;max-width:900px;margin:2rem auto;padding:0 1rem;color:#17212b}pre{background:#f4f7f9;padding:1rem;overflow:auto}button{padding:.55rem 1rem}</style></head><body><h1>建筑抗震鉴定与加固排序</h1><p>依据结构、用途、人员密度和历史缺陷生成鉴定与加固优先级</p><p>风险分值和人员密度共同影响排序；审核通过前必须完成评估、设计和施工证据登记。</p><button onclick="loadItems()">刷新列表</button><pre id="out">使用X-Actor和X-Role请求头调用接口。</pre><script>async function loadItems(){const r=await fetch('/api/items',{headers:{'X-Actor':'demo','X-Role':'viewer'}});document.getElementById('out').textContent=JSON.stringify(await r.json(),null,2)}</script></body></html>
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>建筑抗震鉴定与加固排序</title>
+<style>
+body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;max-width:960px;margin:2rem auto;padding:0 1rem;color:#17212b}
+h1{margin-bottom:.25rem}
+.card{border:1px solid #d5dde3;border-radius:8px;padding:1rem;margin:1rem 0}
+.row{display:flex;gap:.5rem;flex-wrap:wrap;align-items:center}
+table{border-collapse:collapse;width:100%;margin-top:.5rem}
+th,td{border:1px solid #d5dde3;padding:.4rem .6rem;text-align:left;font-size:.9rem;vertical-align:top}
+th{background:#f4f7f9}
+button{padding:.45rem .9rem;cursor:pointer}
+input,select,textarea{padding:.4rem;border:1px solid #b8c4cc;border-radius:4px;font:inherit}
+textarea{width:100%;box-sizing:border-box}
+.tag-open{color:#a33;background:#fdeeee;border-radius:4px;padding:0 .35rem;font-size:.8rem}
+.tag-closed{color:#27632a;background:#ecf7ed;border-radius:4px;padding:0 .35rem;font-size:.8rem}
+.muted{color:#5f7180;font-size:.85rem}
+#msg{min-height:1.2em}
+.ok{color:#27632a}.err{color:#a33}
+</style>
+</head>
+<body>
+<h1>建筑抗震鉴定与加固排序</h1>
+<p class="muted">复核事项处置：评估员/结构工程师按事项编号提交处理说明并关闭；审核委员会发现处置不实时可重开（须填原因）。每次处置推进项目版本，关闭全部待办后项目才能验收。</p>
+
+<div class="card">
+  <div class="row">
+    <label>操作人 <input id="actor" value="demo" size="10"></label>
+    <label>角色
+      <select id="role">
+        <option value="assessor">assessor 评估员</option>
+        <option value="structural_engineer">structural_engineer 结构工程师</option>
+        <option value="review_board" selected>review_board 审核委员会</option>
+        <option value="viewer">viewer 观察员</option>
+      </select>
+    </label>
+    <button onclick="loadAll()">刷新</button>
+  </div>
+</div>
+
+<div class="card">
+  <h3>提交处置（按事项编号）</h3>
+  <div class="row">
+    <label>事项编号 <input id="dRecord" type="number" min="1" placeholder="如 2" style="width:8rem"></label>
+    <label>项目当前版本 <input id="dVersion" type="number" min="1" placeholder="expected_version" style="width:10rem"></label>
+    <label>动作
+      <select id="dAction">
+        <option value="close">close 提交处理说明并关闭</option>
+        <option value="reopen">reopen 重开（审核委员会）</option>
+      </select>
+    </label>
+  </div>
+  <p><textarea id="dNote" rows="2" placeholder="close：处理说明；reopen：重开原因（必填）"></textarea></p>
+  <button onclick="dispose()">提交处置</button>
+  <span id="msg"></span>
+</div>
+
+<div class="card">
+  <h3>项目列表</h3>
+  <table id="itemsTable">
+    <thead><tr><th>ID</th><th>名称</th><th>状态</th><th>版本</th><th>待办事项</th><th>验收</th><th></th></tr></thead>
+    <tbody></tbody>
+  </table>
+</div>
+
+<div class="card">
+  <h3>事项列表 <span class="muted" id="recordHint"></span></h3>
+  <table id="recordsTable">
+    <thead><tr><th>编号</th><th>类型</th><th>说明</th><th>状态</th><th>最近处置</th><th>处置历史</th></tr></thead>
+    <tbody></tbody>
+  </table>
+  <h4 id="blockingTitle" style="margin-bottom:.25rem">仍挡住验收的事项</h4>
+  <div id="blockingList" class="muted">选择项目后加载</div>
+</div>
+
+<script>
+let currentItem = null;
+function headers(){return {'X-Actor':document.getElementById('actor').value||'demo',
+  'X-Role':document.getElementById('role').value,'Content-Type':'application/json'};}
+function setMsg(t,ok){const e=document.getElementById('msg');e.textContent=t;
+  e.className=ok?'ok':'err';}
+async function api(path,opts){
+  const r=await fetch(path,opts);const data=await r.json();
+  if(!r.ok)throw new Error(data.message||data.error||('HTTP '+r.status));
+  return data;
+}
+async function loadItems(){
+  const data=await api('/api/items',{headers:headers()});
+  const tb=document.querySelector('#itemsTable tbody');tb.innerHTML='';
+  data.items.forEach(it=>{
+    const tr=document.createElement('tr');
+    const blocked=it.acceptance_blocked;
+    tr.innerHTML=`<td>${it.id}</td><td>${it.title}</td><td>${it.status}</td>
+      <td>${it.version}</td><td>${it.open_record_count}</td>
+      <td>${blocked?'<span class="tag-open">被待办挡住</span>':'可继续'}</td>
+      <td><button onclick="selectItem(${it.id},${it.version})">查看事项</button></td>`;
+    tb.appendChild(tr);
+  });
+  return data.items;
+}
+async function selectItem(id,version){
+  currentItem=id;
+  document.getElementById('dVersion').value=version;
+  document.getElementById('recordHint').textContent='项目 #'+id;
+  await loadRecords();
+}
+async function loadRecords(){
+  if(currentItem==null){
+    const items=await loadItems();
+    if(items.length){await selectItem(items[items.length-1].id,items[items.length-1].version);}
+    return;
+  }
+  const [recs,block]=await Promise.all([
+    api('/api/items/'+currentItem+'/records',{headers:headers()}),
+    api('/api/items/'+currentItem+'/blocking',{headers:headers()})
+  ]);
+  const tb=document.querySelector('#recordsTable tbody');tb.innerHTML='';
+  for(const r of recs.records){
+    const last=r.disposition_at?`${r.disposition_by||''} ${r.disposition_at}<br>${r.reopen_reason?('重开：'+r.reopen_reason):('处理：'+(r.disposition_note||''))}`:'—';
+    const tr=document.createElement('tr');
+    tr.innerHTML=`<td>${r.id}</td><td>${r.kind}</td><td>${r.detail}</td>
+      <td><span class="tag-${r.status}">${r.status}</span></td>
+      <td class="muted">${last}</td>
+      <td><button onclick="loadDispositions(${r.id},this)">查看</button></td>`;
+    tb.appendChild(tr);
+  }
+  const bl=document.getElementById('blockingList');
+  if(block.blocking.length===0){
+    bl.innerHTML='<span class="ok">无待办事项，项目可继续验收</span>';
+  }else{
+    bl.innerHTML='<table><thead><tr><th>编号</th><th>类型</th><th>说明</th><th>提出人</th></tr></thead><tbody>'+
+      block.blocking.map(r=>`<tr><td>${r.id}</td><td>${r.kind}</td><td>${r.detail}</td><td>${r.created_by}</td></tr>`).join('')+
+      '</tbody></table>';
+  }
+}
+async function loadDispositions(id,btn){
+  const data=await api('/api/records/'+id+'/dispositions',{headers:headers()});
+  const text=data.dispositions.map(d=>`#${d.id} ${d.action} v${d.from_version}→v${d.to_version} ${d.actor}：${d.note}`).join('\n');
+  alert('事项 '+id+' 的处置历史：\n'+(text||'（无）'));
+  btn.textContent='已查看';
+}
+async function dispose(){
+  setMsg('提交中…',true);
+  try{
+    const payload={action:document.getElementById('dAction').value,
+      note:document.getElementById('dNote').value,
+      expected_version:parseInt(document.getElementById('dVersion').value,10)};
+    const rid=parseInt(document.getElementById('dRecord').value,10);
+    const data=await api('/api/records/'+rid+'/dispositions',
+      {method:'POST',headers:headers(),body:JSON.stringify(payload)});
+    setMsg('已'+(payload.action==='close'?'关闭':'重开')+'事项 '+rid+'，项目版本现为 v'+data.item.version,true);
+    document.getElementById('dNote').value='';
+    await loadAll();
+  }catch(e){setMsg('失败：'+e.message,false);}
+}
+async function loadAll(){
+  setMsg('',true);
+  try{
+    const items=await loadItems();
+    if(currentItem!=null){
+      const it=items.find(x=>x.id===currentItem);
+      if(it)document.getElementById('dVersion').value=it.version;
+      await loadRecords();
+    }else if(items.length){
+      await selectItem(items[items.length-1].id,items[items.length-1].version);
+    }
+  }catch(e){setMsg('加载失败：'+e.message,false);}
+}
+loadAll();
+</script>
+</body>
+</html>

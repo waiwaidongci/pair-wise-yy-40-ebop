@@ -88,12 +88,24 @@ def make_handler(service: Service, static_dir: str):
                     item_id = int(path.split("/")[3])
                     actor, role = self._identity()
                     del actor
-                    self._json(200, {"records": service.list_records(item_id, role)})
+                    status = parse_qs(urlparse(self.path).query).get("status", [None])[0]
+                    self._json(200, {"records": service.list_records(item_id, role, status)})
+                elif path.startswith("/api/items/") and path.endswith("/blocking"):
+                    item_id = int(path.split("/")[3])
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, {"blocking": service.blocking_records(item_id, role)})
                 elif path.startswith("/api/items/"):
                     item_id = int(path.rsplit("/", 1)[-1])
                     actor, role = self._identity()
                     del actor
                     self._json(200, service.get_item(item_id, role))
+                elif path.startswith("/api/records/") and path.endswith("/dispositions"):
+                    record_id = int(path.split("/")[3])
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, {
+                        "dispositions": service.list_dispositions(record_id, role)})
                 elif path == "/api/audit":
                     actor, role = self._identity()
                     del actor
@@ -119,6 +131,10 @@ def make_handler(service: Service, static_dir: str):
                     expected = body.get("expected_version")
                     self._json(200, service.transition(
                         item_id, target, expected, actor, role))
+                elif path.startswith("/api/records/") and path.endswith("/dispositions"):
+                    record_id = int(path.split("/")[3])
+                    self._json(201, service.dispose_record(
+                        record_id, body, actor, role))
                 else:
                     self._json(404, {"error": "not_found"})
             except Exception as exc:
